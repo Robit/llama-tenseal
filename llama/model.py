@@ -9,6 +9,15 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+import tenseal as ts
+
+context = ts.context(
+            ts.SCHEME_TYPE.CKKS,
+            poly_modulus_degree=4096,
+            coeff_mod_bit_sizes=[40, 20, 40]
+        )
+context.generate_galois_keys()
+context.global_scale = 2**20
 
 @dataclass
 class ModelArgs:
@@ -56,15 +65,53 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
 def apply_rotary_emb(
         xq: torch.Tensor,
         xk: torch.Tensor,
+        n_local_heads, head_dim, seqlen,
         freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    """
+    ll = torch.view_as_real(freqs_cis)[:, :, 0:1]
+    freqs_cis_l = torch.cat((ll, ll), dim=-1).flatten(1).view(seqlen, 1, -1)  # shape: (seq_len, 1, 128)
+    rr = torch.view_as_real(freqs_cis)[:, :, 1:2]  # shape: (seq_len, 64, 1)
+    freqs_cis_r = torch.cat((-rr, rr), dim=-1).flatten(1).view(seqlen, 1, -1)  # shape: (seq_len, 1, 128)
+    xq_ = xq.view(seqlen, n_local_heads, head_dim//2, 2)[:, :, :, [1, 0]].flatten(2)
+    xq = xq * freqs_cis_l + xq_ * freqs_cis_r
+    xk_ = xk.view(seqlen, n_local_heads, head_dim//2, 2)[:, :, :, [1, 0]].flatten(2)
+    xk = xk * freqs_cis_l + xk_ * freqs_cis_r
+    return xq, xk
+    """
+    
+    #import time
+    #start_time = time.time()
 
+    xq = ts.ckks_tensor(context, xq)
+    xk = ts.ckks_tensor(context, xk)
+
+    #print(f"Time in enc {time.time() - start_time:.2f}") #6.04
+    
+    #start_time = time.time()
+
+    ll = torch.view_as_real(freqs_cis)[:, :, 0:1]
+    freqs_cis_l = torch.cat((ll, ll), dim=-1).flatten(1).view(seqlen, 1, -1)
+    rr = torch.view_as_real(freqs_cis)[:, :, 1:2]
+    freqs_cis_r = torch.cat((-rr, rr), dim=-1).flatten(1).view(seqlen, 1, -1)
+    xq_ = xq.reshape([seqlen, n_local_heads, head_dim//2, 2])[:, :, :, slice(0, 2)].reshape([seqlen, n_local_heads, head_dim]) # 1,0 -> 0,1 .flatten(2) -> .reshape([seqlen, n_local_heads, head_dim])
+    xq = xq * freqs_cis_l + xq_ * freqs_cis_r
+    xk_ = xk.reshape([seqlen, n_local_heads, head_dim//2, 2])[:, :, :, slice(0, 2)].reshape([seqlen, n_local_heads, head_dim]) # 1,0 -> 0,1 .flatten(2) -> .reshape([seqlen, n_local_heads, head_dim])
+    xk = xk * freqs_cis_l + xk_ * freqs_cis_r
+
+    #print(f"Time in op {time.time() - start_time:.2f}") #21.64
+ 
+    #start_time = time.time()
+
+    xq_dec = xq.decrypt()
+    xk_dec = xk.decrypt()
+
+    #print(f"Time in dec {time.time() - start_time:.2f}") #10.17
+    
+    return plainToTorch(xq_dec), plainToTorch(xk_dec)
+
+def plainToTorch(plain):
+    return torch.tensor(plain.raw[0 : math.prod(plain.shape)], dtype=torch.float32).reshape(plain.shape)
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -112,7 +159,7 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = apply_rotary_emb(xq, xk, self.n_local_heads, self.head_dim, seqlen, freqs_cis=freqs_cis)
 
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
