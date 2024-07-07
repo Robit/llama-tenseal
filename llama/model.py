@@ -10,11 +10,12 @@ from torch import nn
 import torch.nn.functional as F
 
 import tenseal as ts
+import time
 
 context = ts.context(
             ts.SCHEME_TYPE.CKKS,
-            poly_modulus_degree=4096,
-            coeff_mod_bit_sizes=[40, 20, 40]
+            poly_modulus_degree = 8192,
+            coeff_mod_bit_sizes = [20, 20, 20, 20, 20, 21, 21, 21, 21, 21]
         )
 context.generate_galois_keys()
 context.global_scale = 2**20
@@ -79,12 +80,11 @@ def apply_rotary_emb(
     xk = xk * freqs_cis_l + xk_ * freqs_cis_r
     return xq, xk
     """
-    
-    #import time
+    #"""
     #start_time = time.time()
 
-    xq = ts.ckks_tensor(context, xq)
-    xk = ts.ckks_tensor(context, xk)
+    #xq = ts.ckks_tensor(context, xq)
+    #xk = ts.ckks_tensor(context, xk)
 
     #print(f"Time in enc {time.time() - start_time:.2f}") #6.04
     
@@ -103,15 +103,17 @@ def apply_rotary_emb(
  
     #start_time = time.time()
 
-    xq_dec = xq.decrypt()
-    xk_dec = xk.decrypt()
-
     #print(f"Time in dec {time.time() - start_time:.2f}") #10.17
     
-    return plainToTorch(xq_dec), plainToTorch(xk_dec)
+    return xq, xk
+    #"""
 
 def plainToTorch(plain):
     return torch.tensor(plain.raw[0 : math.prod(plain.shape)], dtype=torch.float32).reshape(plain.shape)
+
+def encryptedLinearTransform(linear, tensor):
+    tensor = tensor.decrypt()
+    return ts.ckks_tensor(context, linear(plainToTorch(tensor)))
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -153,13 +155,38 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         bsz, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        x = ts.ckks_tensor(context, x.squeeze())
+        
+        start_time = time.time()
+        xq = encryptedLinearTransform(self.wq, x)
+        print("xq transform done")
 
+        xk = encryptedLinearTransform(self.wk, x)
+        print("xk transform done")
+
+        xv = encryptedLinearTransform(self.wv, x)
+        print("transforms done")
+        print(f"Time: {time.time() - start_time:.2f}")
+
+        start_time = time.time()
+        xq = xq.reshape([seqlen, self.n_local_heads, self.head_dim])
+        print("reshape1 done")
+        xk = xk.reshape([seqlen, self.n_local_heads, self.head_dim])
+        print("reshape2 done")
+        xv = xv.reshape([seqlen, self.n_local_heads, self.head_dim])
+        print("reshape3 done")
+        print(f"Time: {time.time() - start_time:.2f}")
+
+        start_time = time.time()
         xq, xk = apply_rotary_emb(xq, xk, self.n_local_heads, self.head_dim, seqlen, freqs_cis=freqs_cis)
+        print("apply_rotary_embedding done")
+        print(f"Time: {time.time() - start_time:.2f}")
+
+        start_time = time.time()
+        xq, xk, xv = plainToTorch(xq.decrypt()), plainToTorch(xk.decrypt()), plainToTorch(xv.decrypt())
+        print("decrypt done")
+        print(f"Time: {time.time() - start_time:.2f}")
 
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
@@ -170,7 +197,7 @@ class Attention(nn.Module):
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
-        xq = xq.transpose(1, 2)
+        xq = xq.transpose(0, 1)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
